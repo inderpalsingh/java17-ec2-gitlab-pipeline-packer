@@ -1,0 +1,105 @@
+image: openjdk:17-jdk-slim
+
+variables:
+  AWS_DEFAULT_REGION: us-east-1
+  APP_NAME: java-ec2-app
+  DEPLOY_ENV: production
+
+stages:
+  - build
+  - test
+  - package
+  - create-ami
+  - deploy
+  - verify
+
+cache:
+  paths:
+    - .gradle/wrapper
+    - .gradle/caches
+
+before_script:
+  - apt-get update && apt-get install -y unzip curl
+  - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+  - unzip awscliv2.zip
+  - ./aws/install
+  - export PATH=$PATH:/usr/local/bin
+
+build:
+  stage: build
+  script:
+    - ./gradlew clean build -x test
+  artifacts:
+    paths:
+      - build/libs/*.jar
+    expire_in: 1 hour
+
+test:
+  stage: test
+  script:
+    - ./gradlew test
+  artifacts:
+    paths:
+      - build/test-results/test/
+
+package:
+  stage: package
+  script:
+    - mkdir -p artifacts
+    - cp build/libs/*.jar artifacts/
+    - echo "VERSION=${CI_COMMIT_SHA:0:8}" > artifacts/version.txt
+  artifacts:
+    paths:
+      - artifacts/
+    expire_in: 1 week
+
+create-ami:
+  stage: create-ami
+  image: hashicorp/packer:latest
+  before_script:
+    - apk add --no-cache curl unzip python3 py3-pip
+    - pip3 install awscli
+  script:
+    - cd packer
+    - packer build -var "aws_access_key=${AWS_ACCESS_KEY_ID}" -var "aws_secret_key=${AWS_SECRET_ACCESS_KEY}" ami-template.json
+  only:
+    - main
+
+deploy:
+  stage: deploy
+  script:
+    - chmod +x scripts/deploy.sh
+    - ./scripts/deploy.sh
+  environment:
+    name: production
+    url: http://${EC2_INSTANCE_IP}:8080
+  only:
+    - main
+  when: manual
+
+rolling-deploy:
+  stage: deploy
+  script:
+    - chmod +x scripts/rolling-update.sh
+    - ./scripts/rolling-update.sh
+  environment:
+    name: production
+  only:
+    - main
+  when: manual
+
+verify:
+  stage: verify
+  script:
+    - |
+      for i in {1..30}; do
+        if curl -f http://${EC2_INSTANCE_IP}:8080/health; then
+          echo "Deployment successful!"
+          exit 0
+        fi
+        sleep 10
+      done
+      echo "Health check failed"
+      exit 1
+  only:
+    - main
